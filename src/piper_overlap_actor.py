@@ -158,6 +158,13 @@ class PiperOverlapActor:
         self.trace_events = dict()
         self.trace_data = defaultdict(list)
 
+        # A2A overlap state (used when mode == "overlapped")
+        self.n_a2a_ops = 0
+        self.fwd_a2a_pre_events = []
+        self.bwd_a2a_pre_events = []
+        self.fwd_a2a_counter = 0
+        self.bwd_a2a_counter = 0
+
         from .piper_utils import piper_metadata
 
         piper_metadata.actor_self = self
@@ -645,7 +652,7 @@ class PiperOverlapActor:
         self.inp_activation[stage_id][mb_idx] = None
     
     def _forward(self, stage_id: int, mb_idx: int, *deps):
-        if self.mode == "sequential":
+        if self.mode == "sequential" or self.mode == "overlapped":
             comp_stream = self.comp_stream
         elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
@@ -740,7 +747,7 @@ class PiperOverlapActor:
         return 1
 
     def _backward(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        if self.mode == "sequential":
+        if self.mode == "sequential" or self.mode == "overlapped":
             comp_stream = self.comp_stream
         elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
@@ -802,6 +809,14 @@ class PiperOverlapActor:
 
         return 1
 
+    def _count_a2a_ops(self, stage_id):
+        from .piper_graph_transform import _dispatch_a2a_single
+        count = 0
+        for node in self.graph_modules[stage_id].graph.nodes:
+            if node.op == "call_function" and node.target is _dispatch_a2a_single:
+                count += 1
+        return count
+
     def _forward_backward(self, fwd_stage_id: int, fwd_mb_idx: int, bwd_stage_id: int, bwd_mb_idx: int, *deps, loss_fn=None):
         if self.mode == "sequential":
             fwd_comp_stream = self.comp_stream
@@ -809,6 +824,9 @@ class PiperOverlapActor:
         elif self.mode == "naive":
             fwd_comp_stream = self.per_mb_streams[(fwd_stage_id + fwd_mb_idx) % 2]
             bwd_comp_stream = self.per_mb_streams[(bwd_stage_id + bwd_mb_idx) % 2]
+        elif self.mode == "overlapped":
+            fwd_comp_stream = self.comp_stream
+            bwd_comp_stream = self.overlapped_comp_stream
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         fwd_p2p_stream = self.p2p_stream
@@ -857,6 +875,17 @@ class PiperOverlapActor:
             )
             self.inp_activation[fwd_stage_id][fwd_mb_idx] = inp_with_grad[0]
 
+        # SETUP A2A OVERLAP
+        if self.mode == "overlapped":
+            n_fwd_a2a = self._count_a2a_ops(fwd_stage_id)
+            n_bwd_a2a = self._count_a2a_ops(bwd_stage_id)
+            if n_fwd_a2a > 0 and n_fwd_a2a == n_bwd_a2a:
+                self.n_a2a_ops = n_fwd_a2a
+                self.fwd_a2a_pre_events = [torch.cuda.Event() for _ in range(n_fwd_a2a)]
+                self.bwd_a2a_pre_events = [torch.cuda.Event() for _ in range(n_bwd_a2a)]
+                self.fwd_a2a_counter = 0
+                self.bwd_a2a_counter = 0
+
         # RUN FORWARD PASS
         if self.profile:
             forward_ctx_manager = torch.profiler.record_function(f"forward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}")
@@ -865,7 +894,7 @@ class PiperOverlapActor:
         with torch.cuda.stream(fwd_comp_stream):
             output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
         self._stop_timing(fwd_comp_stream, "forward_comp")
-        
+
         if self.profile:
             forward_ctx_manager.__exit__(None, None, None)
             backward_ctx_manager = torch.profiler.record_function(f"backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
@@ -885,6 +914,10 @@ class PiperOverlapActor:
             assert out_activation.shape == labels.shape
 
         # RUN BACKWARD PASS
+        # Make bwd wait for fwd to reach first A2A before starting
+        if self.mode == "overlapped" and self.n_a2a_ops > 0:
+            bwd_comp_stream.wait_event(self.fwd_a2a_pre_events[0])
+
         if bwd_stage_id < self.num_stages - 1:
             self._start_timing(bwd_comp_stream, "backward_comp")
             with torch.cuda.stream(bwd_comp_stream):
@@ -929,6 +962,9 @@ class PiperOverlapActor:
         # POST BACKWARD P2P OPERATIONS
         if bwd_stage_id > 0:
             self._exec_p2p_op(bwd_stage_id, bwd_stage_id - 1, bwd_mb_idx, True, None, p2p_stream=bwd_p2p_stream)
+
+        # CLEANUP A2A OVERLAP STATE
+        self.n_a2a_ops = 0
 
         if CLEANUP_MEMORY:
             gc.collect()
